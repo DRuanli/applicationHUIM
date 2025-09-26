@@ -1,0 +1,205 @@
+# Spring Boot Configuration for PTK-HUIM API
+spring:
+  application:
+    name: ptk-huim-api
+    
+  # Database Configuration (H2 for development)
+  datasource:
+    url: jdbc:h2:mem:miningdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: mining
+    password: mining123
+    
+  # H2 Console (for development/debugging)
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+      settings:
+        web-allow-others: true
+        
+  # JPA/Hibernate Configuration
+  jpa:
+    hibernate:
+      ddl-auto: create-drop  # Use 'update' for production
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.H2Dialect
+        
+  # JSON Configuration
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+      indent-output: true
+      
+  # File Upload Configuration
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 50MB
+      max-request-size: 100MB
+      file-size-threshold: 2KB
+      
+  # Actuator Configuration
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,info,metrics
+    endpoint:
+      health:
+        show-details: when_authorized
+        
+# Server Configuration
+server:
+  port: 8080
+  servlet:
+    context-path: /
+  compression:
+    enabled: true
+    mime-types: application/json,text/html,text/xml,text/plain
+    
+# Logging Configuration
+logging:
+  level:
+    root: INFO
+    com.mining: DEBUG
+    org.springframework.web: INFO
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n"
+  file:
+    name: logs/ptk-huim-api.log
+    max-size: 100MB
+    max-history: 30
+    
+# Custom Application Properties
+mining:
+  # Data Configuration
+  data:
+    upload-dir: uploads
+    max-file-size: 50MB
+    allowed-extensions: txt,csv,dat
+    
+  # Algorithm Configuration  
+  algorithm:
+    parallel:
+      threshold: 30
+    task:
+      granularity: 7
+    memory:
+      threshold: 0.85
+    pruning:
+      aggressive-factor: 0.1
+      
+  # Performance Configuration
+  performance:
+    max-threads: ${MINING_MAX_THREADS:8}
+    memory-limit-mb: ${MINING_MEMORY_LIMIT:4096}
+    monitoring-interval-ms: 1000
+    
+  # Async Configuration
+  async:
+    core-pool-size: 2
+    max-pool-size: 10
+    queue-capacity: 100
+    thread-name-prefix: "Mining-"
+    
+  # Export Configuration
+  export:
+    format-default: json
+    include-statistics: true
+    include-timestamp: true
+    
+  # Job Configuration
+  job:
+    default-k: 10
+    default-min-probability: 0.3
+    max-k: 1000
+    cleanup-completed-after-days: 30
+    cleanup-failed-after-days: 7
+    
+---
+# Development Profile
+spring:
+  config:
+    activate:
+      on-profile: dev
+      
+  # Development Database (persistent H2)
+  datasource:
+    url: jdbc:h2:file:./data/miningdb;AUTO_SERVER=TRUE
+    
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    
+logging:
+  level:
+    com.mining: DEBUG
+    org.springframework: DEBUG
+    
+mining:
+  data:
+    upload-dir: dev-uploads
+    
+---
+# Production Profile  
+spring:
+  config:
+    activate:
+      on-profile: prod
+      
+  # Production Database (PostgreSQL example)
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/mining}
+    username: ${DATABASE_USERNAME:mining}
+    password: ${DATABASE_PASSWORD:mining123}
+    driver-class-name: org.postgresql.Driver
+    
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    
+  h2:
+    console:
+      enabled: false
+      
+logging:
+  level:
+    root: INFO
+    com.mining: INFO
+    
+server:
+  port: ${PORT:8080}
+  
+mining:
+  performance:
+    max-threads: ${MINING_MAX_THREADS:16}
+    memory-limit-mb: ${MINING_MEMORY_LIMIT:8192}
+    
+---
+# Test Profile
+spring:
+  config:
+    activate:
+      on-profile: test
+      
+  datasource:
+    url: jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1
+    
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+      
+logging:
+  level:
+    root: WARN
+    com.mining: INFO

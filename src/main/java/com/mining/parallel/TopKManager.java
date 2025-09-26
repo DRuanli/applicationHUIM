@@ -60,7 +60,41 @@ public class TopKManager {
             return false;
         }
 
-        // Try to add to empty slot first
+        // FIRST: Check for duplicates and potential updates
+        for (int i = 0; i < k; i++) {
+            Itemset existing = topKArray.get(i);
+            if (existing != null && existing.getItems().equals(items)) {
+                // Found duplicate - check if needs updating
+                if (expectedUtility > existing.getExpectedUtility() + AlgorithmConstants.EPSILON) {
+                    // Try to update with limited retries
+                    for (int retry = 0; retry < 3; retry++) {
+                        Itemset current = topKArray.get(i);
+                        if (current == null || !current.getItems().equals(items)) {
+                            break; // Item changed or removed, stop trying
+                        }
+
+                        Itemset newItemset = new Itemset(items, expectedUtility, probability);
+                        if (topKArray.compareAndSet(i, current, newItemset)) {
+                            successfulUpdates.incrementAndGet();
+                            updateThreshold();
+                            log.trace("Updated itemset at slot {}: EU {} -> {}",
+                                i, current.getExpectedUtility(), expectedUtility);
+                            return true;
+                        }
+                        casRetries.incrementAndGet();
+                    }
+                    // Failed to update after retries
+                    failedUpdates.incrementAndGet();
+                    return false;
+                } else {
+                    // Duplicate found but doesn't need updating (lower or equal utility)
+                    failedUpdates.incrementAndGet();
+                    return false;
+                }
+            }
+        }
+
+        // SECOND: No duplicate found - try to add to empty slot
         for (int i = 0; i < k; i++) {
             if (topKArray.get(i) == null) {
                 Itemset newItemset = new Itemset(items, expectedUtility, probability);
@@ -76,28 +110,7 @@ public class TopKManager {
             }
         }
 
-        // Check for duplicates and potential updates
-        for (int i = 0; i < k; i++) {
-            Itemset existing = topKArray.get(i);
-            if (existing != null && existing.getItems().equals(items)) {
-                // Found duplicate - update if better
-                if (expectedUtility > existing.getExpectedUtility() + AlgorithmConstants.EPSILON) {
-                    Itemset newItemset = new Itemset(items, expectedUtility, probability);
-                    if (topKArray.compareAndSet(i, existing, newItemset)) {
-                        successfulUpdates.incrementAndGet();
-                        updateThreshold();
-                        log.trace("Updated itemset at slot {}: EU {} -> {}",
-                            i, existing.getExpectedUtility(), expectedUtility);
-                        return true;
-                    }
-                    casRetries.incrementAndGet();
-                }
-                failedUpdates.incrementAndGet();
-                return false; // Duplicate found, no update needed
-            }
-        }
-
-        // Array is full - try to replace weakest
+        // THIRD: Array is full - try to replace weakest
         if (size.get() >= k) {
             return tryReplaceWeakest(items, expectedUtility, probability);
         }
@@ -203,8 +216,8 @@ public class TopKManager {
                 }
             }
 
-            // Sort by utility (descending)
-            result.sort(Comparator.reverseOrder());
+            // Sort by utility (descending) - Itemset.compareTo already implements descending order
+            Collections.sort(result);
 
             return result;
         } finally {
