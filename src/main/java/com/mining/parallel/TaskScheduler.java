@@ -1,39 +1,116 @@
+// File: src/main/java/com/mining/parallel/TaskScheduler.java
 package com.mining.parallel;
 
-import com.mining.core.*;
-import com.mining.mining.*;
+import com.mining.config.AlgorithmConstants;
+import com.mining.core.model.UtilityList;
+import com.mining.engine.MiningEngine;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * TaskScheduler for parallel execution with ForkJoinPool
+ * Enhanced task scheduler for parallel mining with ForkJoinPool.
+ * Implements work-stealing for optimal load balancing.
  */
+@Slf4j
+@Getter
 public class TaskScheduler {
-    private static final int PARALLEL_THRESHOLD = 30;
-    public static final int TASK_GRANULARITY = 7;
 
     private final ForkJoinPool customThreadPool;
     private final AtomicLong peakMemoryUsage;
     private final MiningEngine miningEngine;
+    private final int parallelism;
+
+    // Performance tracking
+    private final AtomicLong totalTasksSubmitted = new AtomicLong(0);
+    private final AtomicLong totalTasksCompleted = new AtomicLong(0);
+    private final AtomicLong totalStealCount = new AtomicLong(0);
 
     public TaskScheduler(int numThreads, AtomicLong peakMemoryUsage, MiningEngine miningEngine) {
-        this.customThreadPool = new ForkJoinPool(numThreads);
+        this.parallelism = numThreads;
         this.peakMemoryUsage = peakMemoryUsage;
         this.miningEngine = miningEngine;
+
+        // Create custom ForkJoinPool with specific configuration
+        this.customThreadPool = new ForkJoinPool(
+            numThreads,
+            ForkJoinPool.defaultForkJoinWorkerThreadFactory,
+            this::handleUncaughtException,
+            false
+        );
+
+        log.info("TaskScheduler initialized with {} threads", numThreads);
     }
 
     /**
-     * ForkJoin task for parallel prefix mining (from ver5_2)
+     * Execute prefix mining in parallel.
+     */
+    public void executePrefixMining(List<Integer> sortedItems,
+                                  Map<Integer, UtilityList> singleItemLists) {
+        if (sortedItems.size() < AlgorithmConstants.PARALLEL_THRESHOLD) {
+            log.debug("Dataset too small for parallel processing, using sequential");
+            miningEngine.executeSequentialMining(sortedItems, singleItemLists);
+            return;
+        }
+
+        log.info("Starting parallel prefix mining for {} items", sortedItems.size());
+
+        try {
+            PrefixMiningTask rootTask = new PrefixMiningTask(
+                sortedItems, singleItemLists, 0, sortedItems.size()
+            );
+
+            totalTasksSubmitted.incrementAndGet();
+            customThreadPool.invoke(rootTask);
+
+            // Update steal count after completion
+            totalStealCount.addAndGet(customThreadPool.getStealCount());
+
+            log.info("Parallel mining completed. Tasks: {}, Steals: {}",
+                totalTasksCompleted.get(), totalStealCount.get());
+
+        } catch (Exception e) {
+            log.error("Error in parallel processing, falling back to sequential", e);
+            miningEngine.executeSequentialMining(sortedItems, singleItemLists);
+        }
+    }
+
+    /**
+     * Execute extension search conditionally in parallel.
+     */
+    public boolean executeExtensionSearch(UtilityList prefix,
+                                        List<UtilityList> extensions,
+                                        Map<Integer, UtilityList> singleItemLists) {
+        // Only parallelize if worth it
+        if (extensions.size() < AlgorithmConstants.PARALLEL_THRESHOLD ||
+            !ForkJoinTask.inForkJoinPool()) {
+            return false;
+        }
+
+        ExtensionSearchTask task = new ExtensionSearchTask(
+            prefix, extensions, singleItemLists, 0, extensions.size()
+        );
+
+        totalTasksSubmitted.incrementAndGet();
+        task.invoke();
+        return true;
+    }
+
+    /**
+     * ForkJoin task for parallel prefix mining.
      */
     public class PrefixMiningTask extends RecursiveAction {
-        protected final List<Integer> sortedItems;
-        protected final Map<Integer, UtilityList> singleItemLists;
-        private final int start, end;
+        private final List<Integer> sortedItems;
+        private final Map<Integer, UtilityList> singleItemLists;
+        private final int start;
+        private final int end;
 
         public PrefixMiningTask(List<Integer> sortedItems,
-                        Map<Integer, UtilityList> singleItemLists,
-                        int start, int end) {
+                              Map<Integer, UtilityList> singleItemLists,
+                              int start, int end) {
             this.sortedItems = sortedItems;
             this.singleItemLists = singleItemLists;
             this.start = start;
@@ -44,43 +121,80 @@ public class TaskScheduler {
         protected void compute() {
             int size = end - start;
 
-            if (size <= TASK_GRANULARITY) {
-                for (int i = start; i < end; i++) {
-                    processPrefix(i);
-                }
-            } else {
-                int mid = start + (size / 2);
-                PrefixMiningTask left = new PrefixMiningTask(sortedItems, singleItemLists, start, mid);
-                PrefixMiningTask right = new PrefixMiningTask(sortedItems, singleItemLists, mid, end);
+            // Base case: process sequentially
+            if (size <= AlgorithmConstants.TASK_GRANULARITY) {
+                processSequentially();
+                totalTasksCompleted.incrementAndGet();
+                return;
+            }
 
-                left.fork();
-                right.compute();
-                left.join();
+            // Recursive case: divide and conquer
+            int mid = start + size / 2;
+
+            PrefixMiningTask leftTask = new PrefixMiningTask(
+                sortedItems, singleItemLists, start, mid
+            );
+
+            PrefixMiningTask rightTask = new PrefixMiningTask(
+                sortedItems, singleItemLists, mid, end
+            );
+
+            totalTasksSubmitted.addAndGet(2);
+
+            // Fork left, compute right, then join
+            leftTask.fork();
+            rightTask.compute();
+            leftTask.join();
+        }
+
+        private void processSequentially() {
+            for (int i = start; i < end; i++) {
+                processPrefix(i);
+
+                // Periodic memory monitoring
+                if (i % 10 == 0) {
+                    updateMemoryUsage();
+                }
             }
         }
 
         private void processPrefix(int index) {
             Integer item = sortedItems.get(index);
-            UtilityList ul = singleItemLists.get(item);
+            UtilityList prefix = singleItemLists.get(item);
 
-            if (ul == null) return;
+            if (prefix == null) {
+                return;
+            }
 
-            double currentThreshold = miningEngine.getTopKManager().getThreshold();
+            // Check if branch should be pruned
             Map<Integer, Double> itemRTWU = miningEngine.getItemRTWU();
+            double threshold = miningEngine.getTopKManager().getThreshold();
 
-            if (itemRTWU.get(item) < currentThreshold - MiningConstants.EPSILON) {
+            if (itemRTWU.get(item) < threshold - AlgorithmConstants.EPSILON) {
                 miningEngine.getStatistics().incrementBranchPruned();
                 return;
             }
 
+            // Build extensions
+            List<UtilityList> extensions = buildExtensions(index);
+
+            if (!extensions.isEmpty()) {
+                miningEngine.searchWithPruning(prefix, extensions, singleItemLists);
+            }
+        }
+
+        private List<UtilityList> buildExtensions(int prefixIndex) {
             List<UtilityList> extensions = new ArrayList<>();
-            for (int j = index + 1; j < sortedItems.size(); j++) {
+            double threshold = miningEngine.getTopKManager().getThreshold();
+            Map<Integer, Double> itemRTWU = miningEngine.getItemRTWU();
+
+            for (int j = prefixIndex + 1; j < sortedItems.size(); j++) {
                 Integer extItem = sortedItems.get(j);
                 UtilityList extUL = singleItemLists.get(extItem);
 
                 if (extUL == null) continue;
 
-                if (itemRTWU.get(extItem) < currentThreshold - MiningConstants.EPSILON) {
+                if (itemRTWU.get(extItem) < threshold - AlgorithmConstants.EPSILON) {
                     miningEngine.getStatistics().incrementRtwuPruned();
                     continue;
                 }
@@ -88,30 +202,24 @@ public class TaskScheduler {
                 extensions.add(extUL);
             }
 
-            if (!extensions.isEmpty()) {
-                miningEngine.searchEnhanced(ul, extensions, singleItemLists);
-            }
-
-            if (index % 10 == 0) {
-                long usedMemory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
-                peakMemoryUsage.updateAndGet(peak -> Math.max(peak, usedMemory));
-            }
+            return extensions;
         }
     }
 
     /**
-     * ForkJoin task for parallel extension search (from ver5_2)
+     * ForkJoin task for parallel extension search.
      */
     public class ExtensionSearchTask extends RecursiveAction {
         private final UtilityList prefix;
         private final List<UtilityList> extensions;
         private final Map<Integer, UtilityList> singleItemLists;
-        private final int start, end;
+        private final int start;
+        private final int end;
 
         public ExtensionSearchTask(UtilityList prefix,
-                           List<UtilityList> extensions,
-                           Map<Integer, UtilityList> singleItemLists,
-                           int start, int end) {
+                                 List<UtilityList> extensions,
+                                 Map<Integer, UtilityList> singleItemLists,
+                                 int start, int end) {
             this.prefix = prefix;
             this.extensions = extensions;
             this.singleItemLists = singleItemLists;
@@ -123,163 +231,173 @@ public class TaskScheduler {
         protected void compute() {
             int size = end - start;
 
-            // Bulk branch pruning for parallel tasks
-            if (size > 1) {
-                double currentThreshold = miningEngine.getTopKManager().getThreshold();
-                double minRTWU = Double.MAX_VALUE;
-                for (int i = start; i < end; i++) {
-                    UtilityList ext = extensions.get(i);
-                    if (ext.rtwu < minRTWU) {
-                        minRTWU = ext.rtwu;
-                    }
-                }
+            // Apply bulk pruning for parallel tasks
+            if (shouldBulkPrune()) {
+                miningEngine.getStatistics().incrementBulkBranchPruned();
+                miningEngine.getStatistics().addCandidatesPruned(size);
+                totalTasksCompleted.incrementAndGet();
+                return;
+            }
 
-                if (minRTWU < currentThreshold - MiningConstants.EPSILON) {
-                    miningEngine.getStatistics().incrementBulkBranchPruned();
-                    miningEngine.getStatistics().addCandidatesPruned(size);
-                    return;
+            // Base case: process sequentially
+            if (size <= AlgorithmConstants.TASK_GRANULARITY) {
+                processSequentially();
+                totalTasksCompleted.incrementAndGet();
+                return;
+            }
+
+            // Recursive case: divide and conquer
+            int mid = start + size / 2;
+
+            ExtensionSearchTask leftTask = new ExtensionSearchTask(
+                prefix, extensions, singleItemLists, start, mid
+            );
+
+            ExtensionSearchTask rightTask = new ExtensionSearchTask(
+                prefix, extensions, singleItemLists, mid, end
+            );
+
+            totalTasksSubmitted.addAndGet(2);
+            invokeAll(leftTask, rightTask);
+        }
+
+        private boolean shouldBulkPrune() {
+            if (end - start <= 1) {
+                return false;
+            }
+
+            double threshold = miningEngine.getTopKManager().getThreshold();
+            double minRTWU = Double.MAX_VALUE;
+
+            for (int i = start; i < end; i++) {
+                UtilityList ext = extensions.get(i);
+                if (ext.getRtwu() < minRTWU) {
+                    minRTWU = ext.getRtwu();
                 }
             }
 
-            if (size <= TASK_GRANULARITY) {
-                for (int i = start; i < end; i++) {
-                    processExtension(i);
-                }
-            } else {
-                int mid = start + (size / 2);
-                ExtensionSearchTask left = new ExtensionSearchTask(
-                    prefix, extensions, singleItemLists, start, mid
-                );
-                ExtensionSearchTask right = new ExtensionSearchTask(
-                    prefix, extensions, singleItemLists, mid, end
-                );
+            return minRTWU < threshold - AlgorithmConstants.EPSILON;
+        }
 
-                invokeAll(left, right);
+        private void processSequentially() {
+            for (int i = start; i < end; i++) {
+                processExtension(i);
             }
         }
 
         private void processExtension(int index) {
             UtilityList extension = extensions.get(index);
+            double threshold = miningEngine.getTopKManager().getThreshold();
 
-            double currentThreshold = miningEngine.getTopKManager().getThreshold();
-            if (extension.rtwu < currentThreshold - MiningConstants.EPSILON) {
+            // Check RTWU pruning
+            if (extension.getRtwu() < threshold - AlgorithmConstants.EPSILON) {
                 miningEngine.getStatistics().incrementRtwuPruned();
-                miningEngine.getStatistics().incrementCandidatesPruned();
                 return;
             }
 
-            UtilityList joined = miningEngine.join(prefix, extension);
+            // Join operation
+            UtilityList joined = miningEngine.getJoinStrategy().join(prefix, extension);
 
-            if (joined == null || joined.elements.isEmpty()) {
+            if (joined == null || joined.isEmpty()) {
                 return;
             }
 
             miningEngine.getStatistics().incrementUtilityListsCreated();
             miningEngine.getStatistics().incrementCandidatesGenerated();
 
+            // Apply pruning strategies
+            if (miningEngine.getPruningStrategy().shouldPrune(joined)) {
+                return;
+            }
+
+            // Check if qualifies for top-K
+            double sumEU = joined.getSumEU();
+            double existProb = joined.getExistentialProbability();
+
+            if (miningEngine.getPruningStrategy().qualifiesForTopK(sumEU, existProb)) {
+                miningEngine.getTopKManager().tryAdd(joined.getItemset(), sumEU, existProb);
+            }
+
+            // Recursive search for larger itemsets
+            if (index < extensions.size() - 1) {
+                List<UtilityList> newExtensions = buildNewExtensions(index);
+                if (!newExtensions.isEmpty()) {
+                    miningEngine.searchWithPruning(joined, newExtensions, singleItemLists);
+                }
+            }
+        }
+
+        private List<UtilityList> buildNewExtensions(int currentIndex) {
+            List<UtilityList> newExtensions = new ArrayList<>();
             double threshold = miningEngine.getTopKManager().getThreshold();
 
-            // Pruning Strategy 1: Existential probability
-            if (joined.existentialProbability < miningEngine.getMinPro() - MiningConstants.EPSILON) {
-                miningEngine.getStatistics().incrementEpPruned();
-                miningEngine.getStatistics().incrementCandidatesPruned();
-                return;
-            }
-
-            // Pruning Strategy 2: EU + remaining - NOW O(1) thanks to ver5_2 optimization!
-            double sumEU = joined.getSumEU();        // O(1) - no computation needed!
-            double sumRemaining = joined.getSumRemaining(); // O(1) - no computation needed!
-
-            if (sumEU + sumRemaining < threshold - MiningConstants.EPSILON) {
-                miningEngine.getStatistics().incrementEuPruned();
-                miningEngine.getStatistics().incrementCandidatesPruned();
-                return;
-            }
-
-            // Update top-k if qualified
-            if (sumEU >= threshold - MiningConstants.EPSILON &&
-                joined.existentialProbability >= miningEngine.getMinPro() - MiningConstants.EPSILON) {
-                miningEngine.getTopKManager().tryAdd(joined.itemset, sumEU, joined.existentialProbability);
-            }
-
-            // Recursive search
-            if (index < extensions.size() - 1) {
-                List<UtilityList> newExtensions = new ArrayList<>();
-                double currentThresholdForFilter = miningEngine.getTopKManager().getThreshold();
-
-                for (int j = index + 1; j < extensions.size(); j++) {
-                    UtilityList ext = extensions.get(j);
-
-                    if (ext.rtwu >= currentThresholdForFilter - MiningConstants.EPSILON) {
-                        newExtensions.add(ext);
-                    } else {
-                        miningEngine.getStatistics().incrementRtwuPruned();
-                    }
-                }
-
-                if (!newExtensions.isEmpty()) {
-                    miningEngine.searchEnhanced(joined, newExtensions, singleItemLists);
+            for (int j = currentIndex + 1; j < extensions.size(); j++) {
+                UtilityList ext = extensions.get(j);
+                if (ext.getRtwu() >= threshold - AlgorithmConstants.EPSILON) {
+                    newExtensions.add(ext);
+                } else {
+                    miningEngine.getStatistics().incrementRtwuPruned();
                 }
             }
+
+            return newExtensions;
         }
     }
 
-    public void executePrefixMining(List<Integer> sortedItems, Map<Integer, UtilityList> singleItemLists) {
-        if (sortedItems.size() >= PARALLEL_THRESHOLD) {
-            System.out.println("Using parallel processing for " + sortedItems.size() + " items");
-
-            try {
-                PrefixMiningTask rootTask = new PrefixMiningTask(
-                    sortedItems, singleItemLists, 0, sortedItems.size()
-                );
-                customThreadPool.invoke(rootTask);
-
-            } catch (Exception e) {
-                System.err.println("Error in parallel processing: " + e.getMessage());
-                e.printStackTrace();
-                miningEngine.sequentialMining(sortedItems, singleItemLists);
-            }
-        } else {
-            System.out.println("Using sequential processing for " + sortedItems.size() + " items");
-            miningEngine.sequentialMining(sortedItems, singleItemLists);
-        }
+    /**
+     * Update peak memory usage.
+     */
+    private void updateMemoryUsage() {
+        long usedMemory = Runtime.getRuntime().totalMemory() -
+                         Runtime.getRuntime().freeMemory();
+        peakMemoryUsage.updateAndGet(peak -> Math.max(peak, usedMemory));
     }
 
-    public boolean executeExtensionSearch(UtilityList prefix, List<UtilityList> viableExtensions,
-                                         Map<Integer, UtilityList> singleItemLists) {
-        if (viableExtensions.size() >= PARALLEL_THRESHOLD && ForkJoinTask.inForkJoinPool()) {
-            ExtensionSearchTask task = new ExtensionSearchTask(
-                prefix, viableExtensions, singleItemLists, 0, viableExtensions.size()
-            );
-            task.invoke();
-            return true;
-        }
-        return false;
+    /**
+     * Handle uncaught exceptions in worker threads.
+     */
+    private void handleUncaughtException(Thread thread, Throwable exception) {
+        log.error("Uncaught exception in thread {}", thread.getName(), exception);
     }
 
+    /**
+     * Shutdown the task scheduler.
+     */
     public void shutdown() {
+        log.info("Shutting down TaskScheduler...");
+
         customThreadPool.shutdown();
+
         try {
             if (!customThreadPool.awaitTermination(60, TimeUnit.SECONDS)) {
-                System.err.println("Thread pool didn't terminate in 60 seconds, forcing shutdown");
+                log.warn("Thread pool didn't terminate gracefully, forcing shutdown");
                 customThreadPool.shutdownNow();
 
-                if (!customThreadPool.awaitTermination(60, TimeUnit.SECONDS)) {
-                    System.err.println("Thread pool didn't terminate after forced shutdown");
+                if (!customThreadPool.awaitTermination(30, TimeUnit.SECONDS)) {
+                    log.error("Thread pool failed to terminate");
                 }
             }
         } catch (InterruptedException e) {
-            System.err.println("Interrupted during shutdown");
+            log.error("Interrupted during shutdown", e);
             customThreadPool.shutdownNow();
             Thread.currentThread().interrupt();
         }
+
+        log.info("TaskScheduler shutdown complete. Total tasks: {}, Completed: {}, Steals: {}",
+            totalTasksSubmitted.get(), totalTasksCompleted.get(), totalStealCount.get());
     }
 
-    public int getParallelism() {
-        return customThreadPool.getParallelism();
-    }
-
-    public static int getParallelThreshold() {
-        return PARALLEL_THRESHOLD;
+    /**
+     * Get performance statistics.
+     */
+    public Map<String, Long> getPerformanceStats() {
+        Map<String, Long> stats = new HashMap<>();
+        stats.put("tasksSubmitted", totalTasksSubmitted.get());
+        stats.put("tasksCompleted", totalTasksCompleted.get());
+        stats.put("stealCount", totalStealCount.get());
+        stats.put("parallelism", (long) parallelism);
+        stats.put("poolSize", (long) customThreadPool.getPoolSize());
+        stats.put("activeThreads", (long) customThreadPool.getActiveThreadCount());
+        return stats;
     }
 }

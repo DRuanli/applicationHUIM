@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  ptk-huim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ptk-huim-app
+    environment:
+      - JAVA_OPTS=-Xms2g -Xmx4g -XX:+UseG1GC
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    command: ["java", "-jar", "ptk-huim-u.jar", "/app/data/input/database.txt", "/app/data/input/profits.txt", "10", "0.3"]
+    networks:
+      - mining-network
+
+networks:
+  mining-network:
+    driver: bridge

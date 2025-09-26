@@ -1,144 +1,268 @@
+// File: src/main/java/com/mining/parallel/TopKManager.java
 package com.mining.parallel;
 
-import com.mining.core.Itemset;
+import com.mining.config.AlgorithmConstants;
+import com.mining.core.model.Itemset;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+
 import java.util.*;
 import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * CAS-based TopKManager from ver5_2 (MAXIMUM PERFORMANCE)
- * - Lock-free operations using AtomicReferenceArray
- * - CAS performance tracking
- * - Optimal for parallel mining workloads
+ * Enhanced lock-free Top-K manager using CAS operations.
+ * Optimized for high-concurrency parallel mining.
  */
+@Slf4j
+@Getter
 public class TopKManager {
-    private static final double EPSILON = 1e-10;
+
     private final int k;
     private final AtomicReferenceArray<Itemset> topKArray;
     private final AtomicInteger size = new AtomicInteger(0);
     private final AtomicReference<Double> threshold = new AtomicReference<>(0.0);
 
-    // Performance tracking from ver5_2
+    // Performance tracking
     private final AtomicLong casRetries = new AtomicLong(0);
     private final AtomicLong successfulUpdates = new AtomicLong(0);
+    private final AtomicLong failedUpdates = new AtomicLong(0);
 
+    // Cache for faster threshold access
     private volatile double cachedThreshold = 0.0;
 
+    // Optional read-write lock for bulk operations
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
     public TopKManager(int k) {
+        if (k <= 0) {
+            throw new IllegalArgumentException("K must be positive");
+        }
+
         this.k = k;
         this.topKArray = new AtomicReferenceArray<>(k);
+
+        log.debug("TopKManager initialized with k={}", k);
     }
 
-    public boolean tryAdd(Set<Integer> items, double eu, double ep) {
-        // Fast path - check cached threshold first
-        if (eu < cachedThreshold - EPSILON) {
+    /**
+     * Try to add an itemset to top-K using lock-free CAS operations.
+     *
+     * @param items The itemset
+     * @param expectedUtility Expected utility value
+     * @param probability Existential probability
+     * @return true if successfully added/updated
+     */
+    public boolean tryAdd(Set<Integer> items, double expectedUtility, double probability) {
+        // Fast path - check cached threshold
+        if (expectedUtility < cachedThreshold - AlgorithmConstants.EPSILON) {
+            failedUpdates.incrementAndGet();
             return false;
         }
 
-        // Check if we can add to any empty slot
+        // Try to add to empty slot first
         for (int i = 0; i < k; i++) {
-            if (topKArray.compareAndSet(i, null, new Itemset(items, eu, ep))) {
-                size.incrementAndGet();
-                successfulUpdates.incrementAndGet();
-                updateThreshold();
-                return true;
+            if (topKArray.get(i) == null) {
+                Itemset newItemset = new Itemset(items, expectedUtility, probability);
+                if (topKArray.compareAndSet(i, null, newItemset)) {
+                    size.incrementAndGet();
+                    successfulUpdates.incrementAndGet();
+                    updateThreshold();
+                    log.trace("Added itemset to slot {}: EU={}", i, expectedUtility);
+                    return true;
+                }
+                // CAS failed, another thread filled this slot
+                casRetries.incrementAndGet();
             }
         }
 
-        // Check for duplicates and better items to replace
+        // Check for duplicates and potential updates
         for (int i = 0; i < k; i++) {
             Itemset existing = topKArray.get(i);
-            if (existing != null && existing.items.equals(items)) {
-                if (eu > existing.expectedUtility + EPSILON) {
-                    Itemset newItemset = new Itemset(items, eu, ep);
-                    if (topKArray.compareAndSet(i, existing, newItemset)) {
-                        successfulUpdates.incrementAndGet();
-                        updateThreshold();
-                        return true;
-                    } else {
-                        casRetries.incrementAndGet();
-                    }
+            // Check if an itemset with the same items exists
+            if (existing != null && existing.getItems().equals(items)) {
+                // --- THIS IS THE FIX ---
+                // Instead of replacing, we accumulate the utility.
+                double newUtility = existing.getExpectedUtility() + expectedUtility;
+                double newProbability = Math.max(existing.getProbability(), probability); // Or average, etc.
+
+                Itemset updatedItemset = new Itemset(items, newUtility, newProbability);
+
+                // Attempt to update the existing itemset with the new, accumulated one
+                if (topKArray.compareAndSet(i, existing, updatedItemset)) {
+                    successfulUpdates.incrementAndGet();
+                    updateThreshold();
+                    log.trace("Accumulated itemset at slot {}: EU {} -> {}",
+                        i, existing.getExpectedUtility(), newUtility);
+                    return true; // Successfully updated the duplicate
                 }
+                // If CAS fails, another thread changed it. Let the operation fail and be retried if needed.
+                casRetries.incrementAndGet();
                 return false;
             }
         }
 
-        // Find weakest item to replace
+        // Array is full - try to replace weakest
         if (size.get() >= k) {
-            int weakestIndex = findWeakestIndex();
-            if (weakestIndex != -1) {
-                Itemset weakest = topKArray.get(weakestIndex);
-                if (weakest != null && eu > weakest.expectedUtility + EPSILON) {
-                    Itemset newItemset = new Itemset(items, eu, ep);
-                    if (topKArray.compareAndSet(weakestIndex, weakest, newItemset)) {
-                        successfulUpdates.incrementAndGet();
-                        updateThreshold();
-                        return true;
-                    } else {
-                        casRetries.incrementAndGet();
-                    }
-                }
-            }
+            return tryReplaceWeakest(items, expectedUtility, probability);
         }
 
+        failedUpdates.incrementAndGet();
         return false;
     }
 
-    private int findWeakestIndex() {
-        double minEU = Double.MAX_VALUE;
-        int minIndex = -1;
+    /**
+     * Try to replace the weakest itemset.
+     */
+    private boolean tryReplaceWeakest(Set<Integer> items, double expectedUtility, double probability) {
+        int maxRetries = Math.min(k, AlgorithmConstants.MAX_CAS_RETRIES);
 
-        for (int i = 0; i < k; i++) {
-            Itemset item = topKArray.get(i);
-            if (item != null && item.expectedUtility < minEU) {
-                minEU = item.expectedUtility;
-                minIndex = i;
+        for (int retry = 0; retry < maxRetries; retry++) {
+            // Find current weakest
+            int weakestIndex = -1;
+            double weakestUtility = Double.MAX_VALUE;
+            Itemset weakestItemset = null;
+
+            for (int i = 0; i < k; i++) {
+                Itemset current = topKArray.get(i);
+                if (current != null && current.getExpectedUtility() < weakestUtility) {
+                    weakestUtility = current.getExpectedUtility();
+                    weakestIndex = i;
+                    weakestItemset = current;
+                }
+            }
+
+            // Check if new itemset is better than weakest
+            if (weakestIndex != -1 && expectedUtility > weakestUtility + AlgorithmConstants.EPSILON) {
+                Itemset newItemset = new Itemset(items, expectedUtility, probability);
+                if (topKArray.compareAndSet(weakestIndex, weakestItemset, newItemset)) {
+                    successfulUpdates.incrementAndGet();
+                    updateThreshold();
+                    log.trace("Replaced weakest at slot {}: EU {} -> {}",
+                        weakestIndex, weakestUtility, expectedUtility);
+                    return true;
+                }
+                casRetries.incrementAndGet();
+                // CAS failed, retry
+            } else {
+                // Not better than weakest
+                failedUpdates.incrementAndGet();
+                return false;
             }
         }
-        return minIndex;
+
+        // Max retries exceeded
+        failedUpdates.incrementAndGet();
+        return false;
     }
 
+    /**
+     * Update the threshold value.
+     */
     private void updateThreshold() {
-        double minEU = Double.MAX_VALUE;
-        int count = 0;
+        if (size.get() < k) {
+            // Not full yet, threshold stays at 0
+            return;
+        }
+
+        // Find minimum utility
+        double minUtility = Double.MAX_VALUE;
+        int validCount = 0;
 
         for (int i = 0; i < k; i++) {
-            Itemset item = topKArray.get(i);
-            if (item != null) {
-                count++;
-                if (item.expectedUtility < minEU) {
-                    minEU = item.expectedUtility;
+            Itemset itemset = topKArray.get(i);
+            if (itemset != null) {
+                validCount++;
+                if (itemset.getExpectedUtility() < minUtility) {
+                    minUtility = itemset.getExpectedUtility();
                 }
             }
         }
 
-        if (count >= k) {
-            threshold.set(minEU);
-            cachedThreshold = minEU;
+        if (validCount >= k) {
+            threshold.set(minUtility);
+            cachedThreshold = minUtility;
+            log.trace("Updated threshold to {}", minUtility);
         }
     }
 
+    /**
+     * Get the current threshold value.
+     */
     public double getThreshold() {
-        return threshold.get();
+        return cachedThreshold;
     }
 
+    /**
+     * Get the current top-K itemsets sorted by utility.
+     */
     public List<Itemset> getTopK() {
-        List<Itemset> result = new ArrayList<>();
-        for (int i = 0; i < k; i++) {
-            Itemset item = topKArray.get(i);
-            if (item != null) {
-                result.add(item);
+        rwLock.readLock().lock();
+        try {
+            List<Itemset> result = new ArrayList<>();
+
+            for (int i = 0; i < k; i++) {
+                Itemset itemset = topKArray.get(i);
+                if (itemset != null) {
+                    result.add(itemset);
+                }
             }
+
+            // Sort by utility (descending)
+            result.sort(Comparator.reverseOrder());
+
+            return result;
+        } finally {
+            rwLock.readLock().unlock();
         }
-        result.sort((a, b) -> Double.compare(b.expectedUtility, a.expectedUtility));
-        return result;
     }
 
-    // Performance metrics from ver5_2!
-    public long getSuccessfulUpdates() {
-        return successfulUpdates.get();
+    /**
+     * Get CAS efficiency metric.
+     */
+    public double getCASEfficiency() {
+        long successful = successfulUpdates.get();
+        long retries = casRetries.get();
+        long total = successful + retries;
+
+        return total > 0 ? (double) successful / total : 1.0;
     }
 
-    public long getCASRetries() {
-        return casRetries.get();
+    /**
+     * Get update success rate.
+     */
+    public double getUpdateSuccessRate() {
+        long successful = successfulUpdates.get();
+        long failed = failedUpdates.get();
+        long total = successful + failed;
+
+        return total > 0 ? (double) successful / total : 0.0;
+    }
+
+    /**
+     * Reset statistics (for testing).
+     */
+    public void resetStatistics() {
+        casRetries.set(0);
+        successfulUpdates.set(0);
+        failedUpdates.set(0);
+    }
+
+    /**
+     * Clear all itemsets (for testing).
+     */
+    public void clear() {
+        rwLock.writeLock().lock();
+        try {
+            for (int i = 0; i < k; i++) {
+                topKArray.set(i, null);
+            }
+            size.set(0);
+            threshold.set(0.0);
+            cachedThreshold = 0.0;
+            resetStatistics();
+        } finally {
+            rwLock.writeLock().unlock();
+        }
     }
 }
