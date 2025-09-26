@@ -83,24 +83,29 @@ class TopKManagerTest {
                 .isGreaterThanOrEqualTo(topK.get(i).getExpectedUtility());
         }
         
-        // Verify CAS operations occurred
-        assertThat(topKManager.getSuccessfulUpdates()).isSameAs(0);
+        // Verify successful updates occurred
+        assertThat(topKManager.getSuccessfulUpdates().get()).isGreaterThan(0);
+
+        // Verify CAS efficiency is reasonable (should be > 50% in most cases)
+        double efficiency = topKManager.getCASEfficiency();
+        assertThat(efficiency).isGreaterThanOrEqualTo(0.5);
     }
-    
+
     @Test
     @DisplayName("Should update duplicate items correctly")
     void shouldUpdateDuplicateItems() {
         // Given
         Set<Integer> items = Set.of(1, 2);
-        
+
         // When - Add same itemset with different utilities
-        assertThat(topKManager.tryAdd(items, 10.0, 0.8)).isTrue();
-        assertThat(topKManager.tryAdd(items, 15.0, 0.8)).isTrue(); // Should update
-        assertThat(topKManager.tryAdd(items, 8.0, 0.8)).isFalse(); // Should not downgrade
-        
+        assertThat(topKManager.tryAdd(items, 10.0, 0.8)).isTrue();  // Initial add
+        assertThat(topKManager.tryAdd(items, 15.0, 0.9)).isTrue();  // Should update (higher utility)
+        assertThat(topKManager.tryAdd(items, 8.0, 0.7)).isFalse();  // Should not update (lower utility)
+
         // Then
         var topK = topKManager.getTopK();
         assertThat(topK).hasSize(1);
         assertThat(topK.get(0).getExpectedUtility()).isEqualTo(15.0);
+        assertThat(topK.get(0).getProbability()).isEqualTo(0.9); // Should have the max probability
     }
 }

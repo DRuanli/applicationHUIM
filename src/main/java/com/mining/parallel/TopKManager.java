@@ -79,26 +79,30 @@ public class TopKManager {
         // Check for duplicates and potential updates
         for (int i = 0; i < k; i++) {
             Itemset existing = topKArray.get(i);
-            // Check if an itemset with the same items exists
             if (existing != null && existing.getItems().equals(items)) {
-                // --- THIS IS THE FIX ---
-                // Instead of replacing, we accumulate the utility.
-                double newUtility = existing.getExpectedUtility() + expectedUtility;
-                double newProbability = Math.max(existing.getProbability(), probability); // Or average, etc.
+                // Found duplicate - only update if new utility is higher
+                if (expectedUtility > existing.getExpectedUtility() + AlgorithmConstants.EPSILON) {
+                    // New utility is higher, replace the itemset
+                    Itemset updatedItemset = new Itemset(items, expectedUtility,
+                        Math.max(existing.getProbability(), probability));
 
-                Itemset updatedItemset = new Itemset(items, newUtility, newProbability);
-
-                // Attempt to update the existing itemset with the new, accumulated one
-                if (topKArray.compareAndSet(i, existing, updatedItemset)) {
-                    successfulUpdates.incrementAndGet();
-                    updateThreshold();
-                    log.trace("Accumulated itemset at slot {}: EU {} -> {}",
-                        i, existing.getExpectedUtility(), newUtility);
-                    return true; // Successfully updated the duplicate
+                    if (topKArray.compareAndSet(i, existing, updatedItemset)) {
+                        successfulUpdates.incrementAndGet();
+                        updateThreshold();
+                        log.trace("Updated itemset at slot {}: EU {} -> {}",
+                            i, existing.getExpectedUtility(), expectedUtility);
+                        return true;
+                    }
+                    // CAS failed, another thread changed it
+                    casRetries.incrementAndGet();
+                    return false;
+                } else {
+                    // New utility is not higher, don't update
+                    failedUpdates.incrementAndGet();
+                    log.trace("Not updating itemset at slot {}: existing EU {} >= new EU {}",
+                        i, existing.getExpectedUtility(), expectedUtility);
+                    return false;
                 }
-                // If CAS fails, another thread changed it. Let the operation fail and be retried if needed.
-                casRetries.incrementAndGet();
-                return false;
             }
         }
 
