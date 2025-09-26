@@ -54,55 +54,16 @@ public class TopKManager {
      * @return true if successfully added/updated
      */
     public boolean tryAdd(Set<Integer> items, double expectedUtility, double probability) {
-        return tryAddWithRetries(items, expectedUtility, probability, 3);
-    }
-
-    private boolean tryAddWithRetries(Set<Integer> items, double expectedUtility, double probability, int remainingRetries) {
-        // Create the new itemset first
-        Itemset newItemset = new Itemset(items, expectedUtility, probability);
-
         // Fast path - check cached threshold
-        if (size.get() >= k && expectedUtility <= cachedThreshold + AlgorithmConstants.EPSILON) {
+        if (expectedUtility < cachedThreshold - AlgorithmConstants.EPSILON) {
             failedUpdates.incrementAndGet();
             return false;
         }
 
-        // Check for duplicates first
-        for (int i = 0; i < k; i++) {
-            Itemset existing = topKArray.get(i);
-            if (existing != null && existing.getItems().equals(items)) {
-                // Found duplicate - only update if new utility is higher
-                if (expectedUtility > existing.getExpectedUtility() + AlgorithmConstants.EPSILON) {
-                    // New utility is higher, replace the itemset
-                    Itemset updatedItemset = new Itemset(items, expectedUtility,
-                        Math.max(existing.getProbability(), probability));
-
-                    if (topKArray.compareAndSet(i, existing, updatedItemset)) {
-                        successfulUpdates.incrementAndGet();
-                        updateThreshold();
-                        log.trace("Updated itemset at slot {}: EU {} -> {}",
-                            i, existing.getExpectedUtility(), expectedUtility);
-                        return true;
-                    }
-                    // CAS failed, another thread changed it
-                    casRetries.incrementAndGet();
-                    if (remainingRetries > 0) {
-                        return tryAddWithRetries(items, expectedUtility, probability, remainingRetries - 1);
-                    }
-                    return false;
-                } else {
-                    // New utility is not higher, don't update
-                    failedUpdates.incrementAndGet();
-                    log.trace("Not updating itemset at slot {}: existing EU {} >= new EU {}",
-                        i, existing.getExpectedUtility(), expectedUtility);
-                    return false;
-                }
-            }
-        }
-
-        // Try to add to empty slot
+        // Try to add to empty slot first
         for (int i = 0; i < k; i++) {
             if (topKArray.get(i) == null) {
+                Itemset newItemset = new Itemset(items, expectedUtility, probability);
                 if (topKArray.compareAndSet(i, null, newItemset)) {
                     size.incrementAndGet();
                     successfulUpdates.incrementAndGet();
@@ -112,6 +73,27 @@ public class TopKManager {
                 }
                 // CAS failed, another thread filled this slot
                 casRetries.incrementAndGet();
+            }
+        }
+
+        // Check for duplicates and potential updates
+        for (int i = 0; i < k; i++) {
+            Itemset existing = topKArray.get(i);
+            if (existing != null && existing.getItems().equals(items)) {
+                // Found duplicate - update if better
+                if (expectedUtility > existing.getExpectedUtility() + AlgorithmConstants.EPSILON) {
+                    Itemset newItemset = new Itemset(items, expectedUtility, probability);
+                    if (topKArray.compareAndSet(i, existing, newItemset)) {
+                        successfulUpdates.incrementAndGet();
+                        updateThreshold();
+                        log.trace("Updated itemset at slot {}: EU {} -> {}",
+                            i, existing.getExpectedUtility(), expectedUtility);
+                        return true;
+                    }
+                    casRetries.incrementAndGet();
+                }
+                failedUpdates.incrementAndGet();
+                return false; // Duplicate found, no update needed
             }
         }
 
@@ -173,29 +155,29 @@ public class TopKManager {
      * Update the threshold value.
      */
     private void updateThreshold() {
-        // Count actual items
-        int actualCount = 0;
+        if (size.get() < k) {
+            // Not full yet, threshold stays at 0
+            return;
+        }
+
+        // Find minimum utility
         double minUtility = Double.MAX_VALUE;
+        int validCount = 0;
 
         for (int i = 0; i < k; i++) {
             Itemset itemset = topKArray.get(i);
             if (itemset != null) {
-                actualCount++;
+                validCount++;
                 if (itemset.getExpectedUtility() < minUtility) {
                     minUtility = itemset.getExpectedUtility();
                 }
             }
         }
 
-        // Only update threshold when array is full
-        if (actualCount >= k) {
+        if (validCount >= k) {
             threshold.set(minUtility);
             cachedThreshold = minUtility;
             log.trace("Updated threshold to {}", minUtility);
-        } else {
-            // Not full yet, threshold stays at 0
-            threshold.set(0.0);
-            cachedThreshold = 0.0;
         }
     }
 
@@ -203,10 +185,6 @@ public class TopKManager {
      * Get the current threshold value.
      */
     public double getThreshold() {
-        // Force update before returning
-        if (size.get() >= k) {
-            updateThreshold();
-        }
         return cachedThreshold;
     }
 

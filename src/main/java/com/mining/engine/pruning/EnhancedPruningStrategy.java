@@ -142,7 +142,7 @@ public class EnhancedPruningStrategy implements PruningStrategy {
 
             if (totalCandidates > 1000) {
                 double pruneRate = (double) prunedCandidates / totalCandidates;
-
+                
                 // Adjust factor based on pruning rate
                 if (pruneRate < 0.5) {
                     // Not pruning enough, be more aggressive
