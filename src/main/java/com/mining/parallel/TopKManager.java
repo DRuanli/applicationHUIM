@@ -54,29 +54,20 @@ public class TopKManager {
      * @return true if successfully added/updated
      */
     public boolean tryAdd(Set<Integer> items, double expectedUtility, double probability) {
+        return tryAddWithRetries(items, expectedUtility, probability, 3);
+    }
+
+    private boolean tryAddWithRetries(Set<Integer> items, double expectedUtility, double probability, int remainingRetries) {
+        // Create the new itemset first
+        Itemset newItemset = new Itemset(items, expectedUtility, probability);
+
         // Fast path - check cached threshold
-        if (expectedUtility < cachedThreshold - AlgorithmConstants.EPSILON) {
+        if (size.get() >= k && expectedUtility <= cachedThreshold + AlgorithmConstants.EPSILON) {
             failedUpdates.incrementAndGet();
             return false;
         }
 
-        // Try to add to empty slot first
-        for (int i = 0; i < k; i++) {
-            if (topKArray.get(i) == null) {
-                Itemset newItemset = new Itemset(items, expectedUtility, probability);
-                if (topKArray.compareAndSet(i, null, newItemset)) {
-                    size.incrementAndGet();
-                    successfulUpdates.incrementAndGet();
-                    updateThreshold();
-                    log.trace("Added itemset to slot {}: EU={}", i, expectedUtility);
-                    return true;
-                }
-                // CAS failed, another thread filled this slot
-                casRetries.incrementAndGet();
-            }
-        }
-
-        // Check for duplicates and potential updates
+        // Check for duplicates first
         for (int i = 0; i < k; i++) {
             Itemset existing = topKArray.get(i);
             if (existing != null && existing.getItems().equals(items)) {
@@ -95,6 +86,9 @@ public class TopKManager {
                     }
                     // CAS failed, another thread changed it
                     casRetries.incrementAndGet();
+                    if (remainingRetries > 0) {
+                        return tryAddWithRetries(items, expectedUtility, probability, remainingRetries - 1);
+                    }
                     return false;
                 } else {
                     // New utility is not higher, don't update
@@ -103,6 +97,21 @@ public class TopKManager {
                         i, existing.getExpectedUtility(), expectedUtility);
                     return false;
                 }
+            }
+        }
+
+        // Try to add to empty slot
+        for (int i = 0; i < k; i++) {
+            if (topKArray.get(i) == null) {
+                if (topKArray.compareAndSet(i, null, newItemset)) {
+                    size.incrementAndGet();
+                    successfulUpdates.incrementAndGet();
+                    updateThreshold();
+                    log.trace("Added itemset to slot {}: EU={}", i, expectedUtility);
+                    return true;
+                }
+                // CAS failed, another thread filled this slot
+                casRetries.incrementAndGet();
             }
         }
 
@@ -164,29 +173,29 @@ public class TopKManager {
      * Update the threshold value.
      */
     private void updateThreshold() {
-        if (size.get() < k) {
-            // Not full yet, threshold stays at 0
-            return;
-        }
-
-        // Find minimum utility
+        // Count actual items
+        int actualCount = 0;
         double minUtility = Double.MAX_VALUE;
-        int validCount = 0;
 
         for (int i = 0; i < k; i++) {
             Itemset itemset = topKArray.get(i);
             if (itemset != null) {
-                validCount++;
+                actualCount++;
                 if (itemset.getExpectedUtility() < minUtility) {
                     minUtility = itemset.getExpectedUtility();
                 }
             }
         }
 
-        if (validCount >= k) {
+        // Only update threshold when array is full
+        if (actualCount >= k) {
             threshold.set(minUtility);
             cachedThreshold = minUtility;
             log.trace("Updated threshold to {}", minUtility);
+        } else {
+            // Not full yet, threshold stays at 0
+            threshold.set(0.0);
+            cachedThreshold = 0.0;
         }
     }
 
@@ -194,6 +203,10 @@ public class TopKManager {
      * Get the current threshold value.
      */
     public double getThreshold() {
+        // Force update before returning
+        if (size.get() >= k) {
+            updateThreshold();
+        }
         return cachedThreshold;
     }
 

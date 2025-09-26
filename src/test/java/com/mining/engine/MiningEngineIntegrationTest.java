@@ -62,11 +62,11 @@ class MiningEngineIntegrationTest {
             assertThat(itemset.getProbability()).isGreaterThanOrEqualTo(0.3)
         );
 
-        // Check that we have some high-utility itemsets
-        // The exact items will depend on the algorithm's behavior
+        // Check that we have some reasonable utility itemsets
+        // Based on the test data, expected utilities should be in range 10-50
         if (!results.isEmpty()) {
-            // The top itemset should have reasonable utility
-            assertThat(results.get(0).getExpectedUtility()).isGreaterThan(0);
+            // The top itemset should have reasonable utility (>= 10.0)
+            assertThat(results.get(0).getExpectedUtility()).isGreaterThanOrEqualTo(10.0);
 
             // Verify itemsets contain valid items
             for (Itemset itemset : results) {
